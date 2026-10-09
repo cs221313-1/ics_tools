@@ -53,6 +53,13 @@ def _build_timestamped_path(output_file):
     return f'{base_name}_{timestamp}'
 
 
+def _coerce_config_value(raw_value, default=None):
+    if raw_value is None:
+        return default
+    value = raw_value.strip()
+    return value if value else default
+
+
 def _build_lin_channel_map():
     for attr, channel in [('NETID_HSCAN', 1), ('NETID_HSCAN2', 2), ('NETID_LIN', 3)]:
         if hasattr(ics, attr):
@@ -106,25 +113,23 @@ class AscWriter:
 
 
 class LinMonitor:
-    def __init__(self, output_file=None, output_format='blf', config_file=None):
+    def __init__(self, output_format='blf', config_file=None):
         devices = ics.find_devices()
         for device in devices:
             print(device.Name, device.serial_number)
 
         if len(devices) == 0:
             raise RuntimeError('No ICS devices found')
-
         self.device = ics.open_device(devices[0])
-        self.output_file = output_file
-        self._asc_writer = AscWriter(_build_timestamped_path(output_file + '.asc')) if output_file else None
         self.output_format = output_format
-        self.vsb_filename = os.path.abspath(_build_timestamped_path(output_file + '.vsb')) if output_file else None
-        self.blf_filename = os.path.abspath(_build_timestamped_path(output_file + '.blf')) if output_file else None
         self.config_file = config_file
-        # print('config_file: {}'.format(self.config_file))
         self._stop_requested = threading.Event()
+        self.output_file = self._read_output_file_value()
+        self._asc_writer = None
+        self.vsb_filename = None
+        self.blf_filename = None
 
-    def _read_config_value(self, key, default=0):
+    def _read_config_value(self, key, default=None):
         if not self.config_file:
             return default
         if not os.path.exists(self.config_file):
@@ -135,16 +140,29 @@ class LinMonitor:
             config.read(self.config_file, encoding='utf-8')
             for section_name in ('monitor', 'DEFAULT'):
                 if config.has_option(section_name, key):
-                    return int(config.get(section_name, key))
+                    return config.get(section_name, key)
             return default
         except Exception as exc:
             raise RuntimeError(f'Failed to read config file {self.config_file}: {exc}') from exc
 
     def _read_stop_value(self):
-        return self._read_config_value('stop', 0)
+        return int(self._read_config_value('stop', 0))
 
     def _read_exit_value(self):
-        return self._read_config_value('exit', 0)
+        return int(self._read_config_value('exit', 0))
+
+    def _read_output_file_value(self):
+        output_file = _coerce_config_value(self._read_config_value('output_file'))
+        if not output_file:
+            raise RuntimeError('Missing output_file in config file')
+        return output_file
+
+    def _rotate_output_targets(self):
+        self.output_file = self._read_output_file_value()
+        # print(f'output_file: {self.output_file}')
+        self._asc_writer = AscWriter(_build_timestamped_path(self.output_file + '.asc'))
+        self.vsb_filename = os.path.abspath(_build_timestamped_path(self.output_file + '.vsb'))
+        self.blf_filename = os.path.abspath(_build_timestamped_path(self.output_file + '.blf'))
 
     def _should_pause(self):
         if not self.config_file:
@@ -166,27 +184,46 @@ class LinMonitor:
 
     def monit(self):
         print('monitoring')
-        blf_writer = can.BLFWriter(self.blf_filename) if self.output_format in ('blf', 'all') else None
-        vsb_writer = VSBWriter(self.vsb_filename) if self.output_format in ('vsb', 'all') else None
         stopped_by_user = False
-        # self._asc_writer.open()
-        # print('Logging to {}'.format(self._asc_writer.filename))
+        blf_writer = None
+        vsb_writer = None
+        previous_stop_value = self._read_stop_value()
+
+        if previous_stop_value == 0:
+            self._rotate_output_targets()
+            blf_writer = can.BLFWriter(self.blf_filename) if self.output_format in ('blf', 'all') else None
+            vsb_writer = VSBWriter(self.vsb_filename) if self.output_format in ('vsb', 'all') else None
 
         try:
             while True:
                 if self._stop_requested.is_set() or self._should_exit():
                     stopped_by_user = True
+                    # print('break')
                     break
-                if self._should_pause():
+
+                current_stop_value = self._read_stop_value()
+                if current_stop_value != 0:
                     time.sleep(0.1)
+                    previous_stop_value = current_stop_value
                     continue
 
+                if previous_stop_value != 0:
+                    if vsb_writer is not None:
+                        vsb_writer.close()
+                    if blf_writer is not None:
+                        blf_writer.stop()
+                    self._rotate_output_targets()
+                    blf_writer = can.BLFWriter(self.blf_filename) if self.output_format in ('blf', 'all') else None
+                    vsb_writer = VSBWriter(self.vsb_filename) if self.output_format in ('vsb', 'all') else None
+                previous_stop_value = current_stop_value
+
+                # print('getting messages')
                 msgs, error_count = ics.get_messages(self.device)
                 for item in msgs:
                     if self._stop_requested.is_set() or self._should_exit():
                         stopped_by_user = True
                         break
-                    if self._should_pause():
+                    if self._read_stop_value() != 0:
                         break
                     if vsb_writer is not None:
                         vsb_writer.write_msg(_spy_to_vsb_message(item))
@@ -215,7 +252,6 @@ class LinMonitor:
                             error_state_indicator=error_state_indicator,
                         )
                         blf_writer.on_message_received(can_msg)
-                    # self._asc_writer.write_message(self.device, item)
 
                 if stopped_by_user:
                     break
@@ -230,21 +266,19 @@ class LinMonitor:
             if blf_writer is not None:
                 blf_writer.stop()
         if stopped_by_user:
-            # self._asc_writer.close()
             print('Monitoring stopped.')
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--output_file', '-o', required=True, help='the data file to be generated')
     parser.add_argument('--output_format', default='blf',
                         help='output format: blf, vsb, all')
-    parser.add_argument('--config_file', '-c', required=True, help='The yaml config file in to read the stop signal')
+    parser.add_argument('--config_file', '-c', required=True, help='The ini config file used to read stop and output settings')
     args = parser.parse_args()
     if args.output_format not in ('vsb', 'blf', 'all'):
         raise ValueError('Only vsb, blf and all are accepted')
     try:
-        monitor = LinMonitor(args.output_file, args.output_format, args.config_file)
+        monitor = LinMonitor(args.output_format, args.config_file)
         monitor.monit()
     except RuntimeError as e:
         print(f'Error: {e}')
